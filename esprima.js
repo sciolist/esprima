@@ -701,6 +701,7 @@ parseStatement: true, parseSourceElement: true */
         case 0x3A:  // :
         case 0x3F:  // ?
         case 0x7E:  // ~
+        case 0x40:  // @ at-expression
             ++index;
             if (extra.tokenize) {
                 if (code === 0x28) {
@@ -1554,6 +1555,24 @@ parseStatement: true, parseSourceElement: true */
             return node;
         },
 
+        createHtmlExpression: function (obj, raw) {
+            if(!raw) return obj;
+            var html = delegate.createIdentifier('html');
+            var property = delegate.createProperty('init', html, obj);
+            return delegate.createObjectExpression([property]);
+        },
+
+        createResponseWriteExpression: function (elements) {
+            if (!(elements instanceof Array)) elements = [elements];
+
+            var getMember = delegate.createMemberExpression(false,
+                    delegate.createIdentifier('response'),
+                    delegate.createIdentifier('push'));
+
+            var call = delegate.createCallExpression(getMember, elements);
+            return delegate.createExpressionStatement(call);
+        },
+
         createArrayExpression: function (elements) {
             return {
                 type: Syntax.ArrayExpression,
@@ -2253,6 +2272,203 @@ parseStatement: true, parseSourceElement: true */
         return expr;
     }
 
+    // http://www.w3.org/TR/html5/syntax.html#void-elements
+    function isHtmlVoidElement(tag) {
+      switch(tag) {
+        case 'area':
+        case 'base':
+        case 'br':
+        case 'col':
+        case 'embed':
+        case 'hr':
+        case 'img':
+        case 'input':
+        case 'keygen':
+        case 'link':
+        case 'meta':
+        case 'param':
+        case 'source':
+        case 'track':
+        case 'wbr':
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    function parseAtExpression() {
+        var isRawExpression, single, result;
+        peek();
+
+        expect('@');
+
+        isRawExpression = match('@');
+        if(isRawExpression) lex();
+
+        if(match('{')) {
+            if(isRawExpression) throwUnexpected(isRawExpression);
+            return parseBlock();
+        }
+
+        if(match('(')) {
+            lex();
+            result = parseExpression();
+            expect(')');
+            return delegate.createResponseWriteExpression(delegate.createHtmlExpression(inner, isRawExpression));
+        }
+
+        single = advance();
+        if(single.type === Token.Keyword && single.value !== 'this') {
+            if(isRawExpression) throwUnexpected(isRawExpression);
+            return parseStatement();
+        }
+
+        result = parseLeftHandSideExpressionAllowCall(true);
+        return delegate.createResponseWriteExpression(delegate.createHtmlExpression(result, isRawExpression));
+    }
+
+    function parseHtmlExpression() {
+        var token = lex();
+        if(token.type !== Token.Punctuator || token.value !== '<') {
+            throwUnexpected(token);
+        }
+
+        var s = null;
+        var start = token.start,
+            state = 'open',
+            stack = [],
+            tokens = [],
+            opening = false,
+            tagIndex = -1,
+            tag = null,
+            quote = null,
+            selfClosing = false
+            ;
+
+        function addHtmlLiteral() {
+            if(start === index) return;
+            var html = source.substring(start, index);
+            var obj = delegate.createLiteral(html);
+            var result = delegate.createResponseWriteExpression(delegate.createHtmlExpression(obj, true));
+            tokens.push(result);
+        }
+
+        while(/\s/.test(source[index])) { index-=1; }
+        index = start;
+        while(index < length) {
+            var ch = source[index];
+            var lt = ch === '<', gt = ch === '>', space = ch === ' ', slash = ch === '/';
+
+            if(state === 'end' && stack.length === 0) {
+                while(/\s/.test(source[index])) { index+=1; }
+                break;
+            }
+
+            if(source[index] === '@') {
+                // handle <div>@i</div> style expressions
+                // within html tags.
+                addHtmlLiteral();
+                var result = parseAtExpression();
+                tokens.push(result);
+                start = index;
+                continue;
+            }
+
+            switch(state) {
+                case 'open':
+                    opening  = source[index + 1] !== '/';
+                    tagIndex = index + (opening ? 1 : 2); // skip < and </
+                    state    = 'tagName';
+                    break;
+                case 'tagName':
+                    if(gt || space) {
+                        tag = source.substring(tagIndex, index);
+                        selfClosing = isHtmlVoidElement(tag);
+                        if(!/\w/.test(tag[0])) selfClosing = true;
+                        state = opening ? 'opening' : 'closing';
+                        break;
+                    }
+                    ++index;
+                    break;
+                case 'opening':
+                    if(gt) {
+                        if(source[index - 1] === '/') selfClosing = true;
+                        if(!selfClosing) stack.push(tag);
+                        state = selfClosing ? 'end' : 'content';
+                        ++index;
+                        break;
+                    }
+                    if(ch === "'" || ch === '"') {
+                        quote = ch;
+                        state = 'quoted';
+                    }
+                    ++index;
+                    break;
+                case 'quoted':
+                    if(ch === quote) {
+                        state = 'opening';
+                    }
+                    ++index;
+                    break;
+                case 'content':
+                    if(lt) {
+                        state = 'open';
+                        break;
+                    }
+                    ++index;
+                    break;
+                case 'closing':
+                    if(gt) {
+                        state = 'end';
+                        ++index;
+                        if(stack.indexOf(tag) === -1) break;
+                        while(stack.length) {
+                            if(tag === stack.pop()) break;
+                        }
+                        tag = stack[stack.length - 1];
+                        break;
+                    }
+                    ++index;
+                    break;
+                case 'end':
+                    state = 'content';
+                    break;
+                default:
+                    throw new Error('unhandled state: ' + s.state);
+            }
+        }
+
+        addHtmlLiteral();
+        token.end = index;
+        lookahead = token;
+        lex();
+
+        if(tokens.length === 1) return tokens[0];
+        return delegate.createBlockStatement(tokens);
+    }
+
+
+    function wrapHtmlBlock(fn) {
+        var response, length, emptyArray;
+        response = delegate.createIdentifier('response');
+        length = delegate.createMemberExpression(false, response, delegate.createIdentifier('length'));
+        emptyArray = delegate.createArrayExpression([]);
+
+        fn.unshift(delegate.createVariableDeclaration(
+            [delegate.createVariableDeclarator(response, emptyArray)]
+        , 'var'));
+
+        fn.push(delegate.createIfStatement(length,
+            delegate.createReturnStatement(delegate.createHtmlExpression(response, true))
+        ));
+
+        return [
+            delegate.createWithStatement(
+                delegate.createIdentifier('__scope'),
+                delegate.createBlockStatement(fn)
+            )
+        ];
+    }
 
     // 11.1 Primary Expressions
 
@@ -3396,6 +3612,14 @@ parseStatement: true, parseSourceElement: true */
             throwUnexpected(lookahead);
         }
 
+        if (type === Token.Punctuator && lookahead.value === '@') {
+            return parseAtExpression(token);
+        }
+
+        if (type === Token.Punctuator && lookahead.value === '<') {
+            return parseHtmlExpression(lookahead);
+        }
+
         if (type === Token.Punctuator && lookahead.value === '{') {
             return parseBlock();
         }
@@ -3536,7 +3760,7 @@ parseStatement: true, parseSourceElement: true */
         state.inFunctionBody = oldInFunctionBody;
         state.parenthesizedCount = oldParenthesisCount;
 
-        return delegate.markEnd(delegate.createBlockStatement(sourceElements), startToken);
+        return delegate.markEnd(delegate.createBlockStatement(wrapHtmlBlock(sourceElements)), startToken);
     }
 
     function validateParam(options, param, name) {
